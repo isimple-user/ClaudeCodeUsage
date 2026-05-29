@@ -24,6 +24,8 @@ interface HttpResponse {
   body: string;
 }
 
+const CREDENTIALS_FILE_MODE = 0o600;
+
 export class ClaudeApiClient {
   private readonly credentialsPath: string;
   private credentials: ClaudeCredentials | null = null;
@@ -66,7 +68,14 @@ export class ClaudeApiClient {
   }
 
   private async saveCredentials(credentials: ClaudeCredentials): Promise<void> {
-    await fs.promises.writeFile(this.credentialsPath, JSON.stringify(credentials), 'utf-8');
+    await fs.promises.mkdir(path.dirname(this.credentialsPath), { recursive: true, mode: 0o700 });
+    await fs.promises.writeFile(this.credentialsPath, JSON.stringify(credentials), {
+      encoding: 'utf-8',
+      mode: CREDENTIALS_FILE_MODE
+    });
+    if (process.platform !== 'win32') {
+      await fs.promises.chmod(this.credentialsPath, CREDENTIALS_FILE_MODE);
+    }
     this.credentials = credentials;
   }
 
@@ -253,7 +262,7 @@ export class ClaudeApiClient {
       }
 
       if (response.status !== 200) {
-        this.log(`usage: non-200 (${response.status}); body head: ${response.body.slice(0, 200)}`);
+        this.log(`usage: non-200 (${response.status})`);
         return null;
       }
       const data = JSON.parse(response.body) as ClaudeApiUsageResponse;
