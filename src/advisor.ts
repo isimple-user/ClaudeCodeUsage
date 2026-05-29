@@ -37,13 +37,23 @@ function normalizeUrl(url: string): string {
     return 'https://api.deepseek.com/chat/completions';
   }
   // DeepSeek's current API endpoint does not use a /v1 prefix.
-  if (/api\.deepseek\.com\/v1(\/chat\/completions)?$/.test(u)) {
+  if (/^https:\/\/api\.deepseek\.com\/v1(\/chat\/completions)?$/i.test(u)) {
     u = u.replace('/v1', '');
   }
   if (!u.endsWith('/chat/completions')) {
     u = `${u}/chat/completions`;
   }
-  return u;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(u);
+  } catch {
+    throw new Error('Advice API URL must be a valid HTTPS URL.');
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error('Advice API URL must use HTTPS so the API key is not sent over an unsafe scheme.');
+  }
+  return parsed.toString();
 }
 
 /**
@@ -80,12 +90,11 @@ export async function getUsageAdvice(options: AdviceOptions): Promise<string> {
   });
 
   if (!response.ok) {
-    const detail = await response.text().catch(() => '');
     const hint =
       response.status === 404
         ? ' (check adviceApiUrl — for DeepSeek it is https://api.deepseek.com/chat/completions)'
         : '';
-    throw new Error(`API ${response.status}${hint}: ${detail.slice(0, 300)}`);
+    throw new Error(`API ${response.status}${hint}`);
   }
 
   const data = (await response.json()) as {
