@@ -24,7 +24,15 @@ interface HttpResponse {
   body: string;
 }
 
-const CREDENTIALS_FILE_MODE = 0o600;
+interface OAuthTokenRefreshResponse {
+  access_token: string;
+  expires_in: number;
+}
+
+const MAX_ACCESS_TOKEN_LENGTH = 16 * 1024;
+const MIN_TOKEN_TTL_SECONDS = 1;
+const MAX_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001F\u007F]/u;
 
 export class ClaudeApiClient {
   private readonly credentialsPath: string;
@@ -67,16 +75,42 @@ export class ClaudeApiClient {
     }
   }
 
-  private async saveCredentials(credentials: ClaudeCredentials): Promise<void> {
-    await fs.promises.mkdir(path.dirname(this.credentialsPath), { recursive: true, mode: 0o700 });
-    await fs.promises.writeFile(this.credentialsPath, JSON.stringify(credentials), {
-      encoding: 'utf-8',
-      mode: CREDENTIALS_FILE_MODE
-    });
-    if (process.platform !== 'win32') {
-      await fs.promises.chmod(this.credentialsPath, CREDENTIALS_FILE_MODE);
+  private parseRefreshTokenResponse(body: string): OAuthTokenRefreshResponse {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      throw new Error('Token refresh returned invalid JSON');
     }
-    this.credentials = credentials;
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Token refresh returned an invalid payload');
+    }
+
+    const data = parsed as Record<string, unknown>;
+    const accessToken = data.access_token;
+    const expiresIn = data.expires_in;
+
+    if (
+      typeof accessToken !== 'string' ||
+      accessToken.length === 0 ||
+      accessToken.length > MAX_ACCESS_TOKEN_LENGTH ||
+      CONTROL_CHARACTER_PATTERN.test(accessToken)
+    ) {
+      throw new Error('Token refresh returned an invalid access_token');
+    }
+
+    if (
+      typeof expiresIn !== 'number' ||
+      !Number.isFinite(expiresIn) ||
+      !Number.isInteger(expiresIn) ||
+      expiresIn < MIN_TOKEN_TTL_SECONDS ||
+      expiresIn > MAX_TOKEN_TTL_SECONDS
+    ) {
+      throw new Error('Token refresh returned an invalid expires_in');
+    }
+
+    return { access_token: accessToken, expires_in: expiresIn };
   }
 
   private isTokenExpired(credentials: ClaudeCredentials): boolean {
@@ -95,7 +129,7 @@ export class ClaudeApiClient {
     if (r.status !== 200) {
       throw new Error(`Token refresh failed: ${r.status}`);
     }
-    const data = JSON.parse(r.body) as { access_token: string; expires_in: number };
+    const data = this.parseRefreshTokenResponse(r.body);
     const updated: ClaudeCredentials = {
       ...credentials,
       claudeAiOauth: {
@@ -104,7 +138,11 @@ export class ClaudeApiClient {
         expiresAt: Date.now() + data.expires_in * 1000
       }
     };
-    await this.saveCredentials(updated);
+
+    // Keep refreshed OAuth data in memory only. Writing network-derived token
+    // responses back to Claude Code's credential file is unnecessary for this
+    // extension and is exactly the flow CodeQL flags as js/http-to-file-access.
+    this.credentials = updated;
     return updated;
   }
 
