@@ -24,10 +24,27 @@ interface HttpResponse {
   body: string;
 }
 
+interface HttpRequestOptions {
+  method?: 'GET' | 'POST';
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+interface CurlRequestOptions extends HttpRequestOptions {
+  timeoutSec?: number;
+}
+
 interface OAuthTokenRefreshResponse {
   access_token: string;
   expires_in: number;
 }
+
+type ClaudeApiEndpoint = 'oauthToken' | 'usage';
+
+const CLAUDE_API_ENDPOINTS: Record<ClaudeApiEndpoint, string> = {
+  oauthToken: 'https://console.anthropic.com/v1/oauth/token',
+  usage: 'https://api.anthropic.com/api/oauth/usage'
+};
 
 const MAX_ACCESS_TOKEN_LENGTH = 16 * 1024;
 const MIN_TOKEN_TTL_SECONDS = 1;
@@ -55,6 +72,51 @@ export class ClaudeApiClient {
     }
   }
 
+  private isValidOAuthToken(value: unknown): value is string {
+    return (
+      typeof value === 'string' &&
+      value.length > 0 &&
+      value.length <= MAX_ACCESS_TOKEN_LENGTH &&
+      !CONTROL_CHARACTER_PATTERN.test(value)
+    );
+  }
+
+  private parseCredentialsFile(content: string): ClaudeCredentials | null {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      return null;
+    }
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const claudeAiOauth = (parsed as Record<string, unknown>).claudeAiOauth;
+    if (!claudeAiOauth || typeof claudeAiOauth !== 'object' || Array.isArray(claudeAiOauth)) {
+      return null;
+    }
+
+    const oauth = claudeAiOauth as Record<string, unknown>;
+    if (
+      !this.isValidOAuthToken(oauth.accessToken) ||
+      !this.isValidOAuthToken(oauth.refreshToken) ||
+      typeof oauth.expiresAt !== 'number' ||
+      !Number.isFinite(oauth.expiresAt)
+    ) {
+      return null;
+    }
+
+    return {
+      claudeAiOauth: {
+        accessToken: oauth.accessToken,
+        refreshToken: oauth.refreshToken,
+        expiresAt: oauth.expiresAt
+      }
+    };
+  }
+
   private async loadCredentials(): Promise<ClaudeCredentials | null> {
     try {
       if (!fs.existsSync(this.credentialsPath)) {
@@ -62,9 +124,9 @@ export class ClaudeApiClient {
         return null;
       }
       const content = await fs.promises.readFile(this.credentialsPath, 'utf-8');
-      const parsed = JSON.parse(content) as ClaudeCredentials;
-      if (!parsed || !parsed.claudeAiOauth || !parsed.claudeAiOauth.accessToken) {
-        this.log('credentials: file present but no claudeAiOauth.accessToken');
+      const parsed = this.parseCredentialsFile(content);
+      if (!parsed) {
+        this.log('credentials: file present but invalid claudeAiOauth credentials');
         return null;
       }
       this.credentials = parsed;
@@ -91,12 +153,7 @@ export class ClaudeApiClient {
     const accessToken = data.access_token;
     const expiresIn = data.expires_in;
 
-    if (
-      typeof accessToken !== 'string' ||
-      accessToken.length === 0 ||
-      accessToken.length > MAX_ACCESS_TOKEN_LENGTH ||
-      CONTROL_CHARACTER_PATTERN.test(accessToken)
-    ) {
+    if (!this.isValidOAuthToken(accessToken)) {
       throw new Error('Token refresh returned an invalid access_token');
     }
 
@@ -118,7 +175,7 @@ export class ClaudeApiClient {
   }
 
   private async refreshAccessToken(credentials: ClaudeCredentials): Promise<ClaudeCredentials> {
-    const r = await this.request('https://console.anthropic.com/v1/oauth/token', {
+    const r = await this.request('oauthToken', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -165,10 +222,9 @@ export class ClaudeApiClient {
 
   /** Run an HTTP request via fetch, falling back to curl on TLS-fingerprint
    * rejection ("403 Request not allowed"). */
-  private async request(
-    url: string,
-    opts: { method?: string; headers?: Record<string, string>; body?: string }
-  ): Promise<HttpResponse> {
+  private async request(endpoint: ClaudeApiEndpoint, opts: HttpRequestOptions): Promise<HttpResponse> {
+    const url = CLAUDE_API_ENDPOINTS[endpoint];
+
     if (!this.preferCurl) {
       try {
         const r = await this.requestViaFetch(url, opts);
@@ -188,13 +244,14 @@ export class ClaudeApiClient {
     return r;
   }
 
-  private async requestViaFetch(
-    url: string,
-    opts: { method?: string; headers?: Record<string, string>; body?: string }
-  ): Promise<HttpResponse> {
+  private async requestViaFetch(url: string, opts: HttpRequestOptions): Promise<HttpResponse> {
     if (typeof fetch === 'undefined') {
       throw new Error('fetch unavailable in this VS Code version');
     }
+
+    // codeql[js/file-access-to-http]: This extension intentionally reads Claude Code's
+    // local OAuth credentials and sends them only to the exact allowlisted Anthropic
+    // OAuth/usage endpoints above after validating the credential shape.
     const res = await fetch(url, {
       method: opts.method || 'GET',
       headers: opts.headers,
@@ -203,10 +260,7 @@ export class ClaudeApiClient {
     return { status: res.status, body: await res.text() };
   }
 
-  private requestViaCurl(
-    url: string,
-    opts: { method?: string; headers?: Record<string, string>; body?: string; timeoutSec?: number }
-  ): Promise<HttpResponse> {
+  private requestViaCurl(url: string, opts: CurlRequestOptions): Promise<HttpResponse> {
     return new Promise((resolve, reject) => {
       const args: string[] = ['-sS', '-w', '\n__CCU_STATUS__%{http_code}', '--max-time', String(opts.timeoutSec ?? 15)];
       if (opts.method && opts.method !== 'GET') {
@@ -251,7 +305,7 @@ export class ClaudeApiClient {
   }
 
   private callUsageApi(accessToken: string): Promise<HttpResponse> {
-    return this.request('https://api.anthropic.com/api/oauth/usage', {
+    return this.request('usage', {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${accessToken}`,
